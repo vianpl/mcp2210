@@ -1,4 +1,4 @@
-obj-m  := hid-mcp2210.o
+obj-m := hid-mcp2210.o gpio-mcp23xx.o
 
 ccflags-y += -g -DDEBUG
 

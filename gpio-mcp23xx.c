@@ -7,24 +7,27 @@
  *  it under the terms of the GNU General Public License version 2 as
  *  published by the Free Software Foundation.
  */
-#include <linux/gpio/consumer.h>
+#include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/init.h>
-#include <linux/mutex.h>
-#include <linux/spi/spi.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
-#include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/regmap.h>
+#include <linux/spi/spi.h>
+#include <linux/gpio/driver.h>
 
-#define MCP23XX_REG_GPIO
+#define MCP23XX_REG_IODIR	0x0
+#define MCP23XX_REG_IOCON	0x5
+#define MCP23XX_REG_GPPU	0x6
+#define MCP23XX_REG_GPIO	0x9
+#define MCP23XX_REG_OLAT	0xA
 
 struct mcp23xx {
-	struct gpio_chip gpio_chip;
-	struct regmap regmap
+	struct gpio_chip gc;
+	struct regmap *regmap;
 };
 
 struct mcp23xx_chip_info {
-	ngpio;
+	unsigned int ngpio;
 };
 
 enum ad7476_supported_device_ids {
@@ -33,40 +36,89 @@ enum ad7476_supported_device_ids {
 
 static const struct mcp23xx_chip_info mcp23xx_spi_chip_info[] = {
 	[ID_MCP23S08] = {
-		.ngpio = 8;
+		.ngpio = 8,
 	},
 };
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,6,0)
+#define gpiochip_get_data(_gc)		container_of(_gc, struct mcp23xx, gc)
+#endif
 
 static int mcp23xx_get_value(struct gpio_chip *gc, unsigned offset)
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+	unsigned int val;
+
+	regmap_read(mcp23xx->regmap, MCP23XX_REG_GPIO, &val);
+
+	return !!(val & offset);
 }
 
-static void mcp23xx_set_value(struct gpio_mcp23xx *gc,
+static void mcp23xx_set_value(struct gpio_chip *gc,
 			      unsigned offset, int val)
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+
+	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_GPIO, 1 << offset, val);
 }
 
-static void mcp23xx_set_multiple(struct gpio_mcp23xx *gc, unsigned long *mask,
+static void mcp23xx_set_multiple(struct gpio_chip *gc, unsigned long *mask,
 				 unsigned long *bits)
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+
+	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_GPIO, *mask, *bits);
 }
 
-static int mcp23xx_direction_output(struct gpio_mcp23xx *gc,
+static int mcp23xx_direction_output(struct gpio_chip *gc,
 				    unsigned offset, int val)
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+
+	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_IODIR, 1 << offset, 0);
+	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_GPIO, 1 << offset, val);
 	return 0;
 }
 
-static int mcp23xx_direction_input(struct gpio_mcp23xx *gc,
-				   unsigned offset, int val)
+static int mcp23xx_direction_input(struct gpio_chip *gc,
+				   unsigned offset)
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+
+	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_IODIR, 1 << offset, 1);
 	return 0;
 }
+
+static int mcp23xx_get_direction(struct gpio_chip *gc, unsigned int offset)
+{
+	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+	unsigned int val;
+
+	regmap_read(mcp23xx->regmap, MCP23XX_REG_IODIR, &val);
+
+	return !!(val & (1 << offset));
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
+static int mcp23xx_gpio_set_config(struct gpio_chip *gc, unsigned offset,
+				   unsigned long config)
+{
+	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
+	enum pin_config_param param = pinconf_to_config_param(config);
+
+	switch (param) {
+	case PIN_CONFIG_DRIVE_PUSH_PULL:
+		reg_update_bits(mcp23xx->regmap, MCP23XX_REG_GPPU, 1 << offset, 0);
+		break;
+	case PIN_CONFIG_DRIVE_OPEN_SOURCE:
+		reg_update_bits(&mcp24xx->regmap, MCP23XX_REG_GPPU, 1 << offset, 1);
+		break;
+	default:
+		return -ENOTSUPP;
+
+	}
+}
+#endif
 
 static bool mcp23xx_volatile_reg(struct device *dev, unsigned int reg)
 {
@@ -82,7 +134,9 @@ static const struct regmap_config mcp23xx_regmap_cfg = {
 	.reg_bits = 8,
 	.val_bits = 8,
 	.max_register = MCP23XX_REG_OLAT,
-	.cache_type = REGCACHE_FLAT,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
+	.cache_type = REGCACHE_GPIO,
+#endif
 	.volatile_reg = mcp23xx_volatile_reg,
 };
 
@@ -92,33 +146,41 @@ static int mcp23xx_probe(struct spi_device *spi)
 	const struct mcp23xx_chip_info *info =
 				&mcp23xx_spi_chip_info[id->driver_data];
 	struct mcp23xx *mcp23xx;
-	u32 nregs;
 	int ret;
 
-	mcp23xx = devm_kzalloc(&spi->dev, sizeof(*mcp23xx) + nregs, GFP_KERNEL);
+	mcp23xx = devm_kzalloc(&spi->dev, sizeof(*mcp23xx), GFP_KERNEL);
 	if (!mcp23xx)
 		return -ENOMEM;
 
-	mcp23xx->gpio_chip.parent = &spi->dev;
-	mcp23xx->gpio_chip.owner = THIS_MODULE;
-	mcp23xx->gpio_chip.get = mcp23xx_get_value;
-	mcp23xx->gpio_chip.set = mcp23xx_set_value;
-	mcp23xx->gpio_chip.direction_output = mcp23xx_direction_output;
-	mcp23xx->gpio_chip.direction_input = mcp23xx_direction_input;
-	mcp23xx->gpio_chip.get_direction = mcp23xx_get_direction;
-	mcp23xx->gpio_chip.set_multiple = mcp23xx_set_multiple;
-	mcp23xx->gpio_chip.can_sleep = true;
-	mcp23xx->gpio_chip.ngpio = info->ngpio;
-	mcp23xx->gpio_chip.base = -1;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
+	mcp23xx->gc.parent = &spi->dev;
+#endif
+	mcp23xx->gc.owner = THIS_MODULE;
+	mcp23xx->gc.get = mcp23xx_get_value;
+	mcp23xx->gc.set = mcp23xx_set_value;
+	mcp23xx->gc.direction_output = mcp23xx_direction_output;
+	mcp23xx->gc.direction_input = mcp23xx_direction_input;
+	mcp23xx->gc.get_direction = mcp23xx_get_direction;
+	mcp23xx->gc.set_multiple = mcp23xx_set_multiple;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
+	mcp23xx->gc.set_config = mcp23xx_gpio_set_config;
+#endif
+	mcp23xx->gc.can_sleep = true;
+	mcp23xx->gc.ngpio = info->ngpio;
+	mcp23xx->gc.base = -1;
 
-	mcp23xx->regmap = devm_regmap_init_spi(spi, &mxp23xx_regmap_cfg);
+	mcp23xx->regmap = devm_regmap_init_spi(spi, &mcp23xx_regmap_cfg);
 	if (IS_ERR(mcp23xx->regmap)) {
 		ret = PTR_ERR(mcp23xx->regmap);
 		dev_err(&spi->dev, "Failed to init regmap\n");
 		goto exit;
 	}
 
-	ret = gpiochip_add_data(&chip->gpio_chip, mcp23xx);
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,6,0)
+	ret = gpiochip_add(&mcp23xx->gc);
+#else
+	ret = gpiochip_add_data(&mcp23xx->gc, mcp23xx);
+#endif
 	if (ret)
 		dev_err(&spi->dev, "Failed to register gpiochip\n");
 
@@ -130,7 +192,7 @@ static int mcp23xx_remove(struct spi_device *spi)
 {
 	struct mcp23xx *mcp23xx = spi_get_drvdata(spi);
 
-	gpiomcp23xx_remove(&mcp23xx->gpio_mcp23xx);
+	gpiochip_remove(&mcp23xx->gc);
 
 	return 0;
 }

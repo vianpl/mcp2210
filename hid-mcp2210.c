@@ -1,20 +1,85 @@
-#include <linux/gpio/driver.h>
-#include <linux/hid.h>
-#include <linux/hidraw.h>
+#include <linux/version.h>
 #include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/completion.h>
 #include <linux/bitops.h>
-#include "../linux/drivers/hid/hid-ids.h"
+#include <linux/hid.h>
+#include <linux/spi/spi.h>
+#include <linux/gpio/driver.h>
+#include "linux-mainline/drivers/hid/hid-ids.h"
 
 #define USB_DEVICE_ID_MCP2210			0x00de
 #define MCP2210_REPORT_SIZE			64
-#define MCP2210_SET_SPI_SETTINGS		0x40
 #define MCP2210_SPI_MIN_SPEED			1500
 #define MCP2210_SPI_MAX_SPEED			12000000
 #define MCP2210_NUM_GPIOS			9
+#define MCP2210_SPI_MAX_TRANSLEN		U16_MAX
+#define MCP2210_SPI_MAX_XFERLEN			60
+
+enum {
+	MCP2210_SET_CHIP_SETTINGS = 0x21,
+	MCP2210_GET_CHIP_SETTINGS = 0x20,
+	MCP2210_SET_SPI_SETTINGS = 0x40,
+	MCP2210_GET_SPI_SETTINGS = 0x41,
+	MCP2210_SPI_TRANSFER = 0x42,
+};
+
+enum {
+	MCP2210_STATUS_COMMAND_COMPLETED = 0x00,
+	MCP2210_STATUS_BUS_NOT_AVAILABLE = 0xF8,
+	MCP2210_STATUS_TX_IN_PROGRESS = 0xF8,
+};
+
+enum {
+	MCP2210_PINCONF_GPIO,
+	MCP2210_PINCONF_CS,
+	MCP2210_PINCONF_DEDICATED,
+
+};
+
+enum {
+	MCP2210_TX_STATUS_FINISHED = 0x10,
+	MCP2210_TX_STATUS_STARTED = 0x20,
+	MCP2210_TX_STATUS_NOT_FINISHED = 0x30,
+};
+
+struct mcp2210_response_report {
+	u8 id;
+	u8 status;
+} __packed;
+
+struct mcp2210_spi_transfer_report {
+	u8 id;
+	u8 len;
+	u16 reserved;
+	u8 data[60];
+} __packed;
+
+struct mcp2210_gpio_settings_report {
+	u8 id;
+	u8 reserved[3];
+	u8 pinconf[MCP2210_NUM_GPIOS];
+	u8 default_gpio_output[2];
+	u8 default_gpio_direction[2];
+	u8 other_settings;
+} __packed;
+
+struct mcp2210_spi_settings_report {
+	u8 id;
+	u8 reserved[3];
+	u32 bit_rate;
+	u16 idle_cs_value;
+	u16 active_cs_value;
+	u16 cs_data_delay;
+	u16 cs_deassert_delay;
+	u16 data_delay;
+	u16 bytes_to_tx;
+	u8 mode;
+} __packed;
 
 struct mcp2210 {
 	struct hid_device *hdev;
-	wait_queue_head_t wait;
+	struct spi_master *spi_master;
 	struct gpio_chip gc;
 	struct mutex lock;
 	struct hid_report *report;
@@ -22,30 +87,52 @@ struct mcp2210 {
 	size_t out_buf_size;
 	char in_buf[64];
 
-	struct spi_master *spi_master;
-	unsigned int requested_gpio_pins;
-	atomic_t transfer_pending;
+	u16 requested_gpio_pins;
+	struct completion report_completion;
+	struct spi_transfer *xfer;
+	u16 xfer_remain;
+	u8 report_status;
 };
 
-static int mcp2210_send_report(struct mcp2210 *mcp2210, char *buf)
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,6,0)
+#define gpiochip_get_data(__gc)		container_of(__gc, struct mcp2210, gc)
+#endif
+
+static int __mcp2210_send_report(struct mcp2210 *mcp2210, bool block)
 {
 	int ret;
 
 	hid_hw_request(mcp2210->hdev, mcp2210->report, HID_REQ_SET_REPORT);
-	ret = wait_event_timeout(&mcp2210->wait,
-			   atomic_get(&transfer_pending),
-			   msecs_to_jiffies(100));
-	if (!ret)
-		return -ETIMEDOUT;
-
-	if (buf)
-		memcpy(mcp2210->in_buf, buf, MCP2210_REPORT_SIZE);
+	if (block) {
+		ret = wait_for_completion_timeout(&mcp2210->report_completion,
+						  msecs_to_jiffies(100));
+		if (!ret)
+			return -ETIMEDOUT;
+	}
 
 	return 0;
 }
+#define mcp2210_send_report(__mcp2210)	__mcp2210_send_report(__mcp2210, true)
+#define mcp2210_send_report_noblock(__mcp2210) \
+					__mcp2210_send_report(__mcp2210, false)
 
 static int mcp2210_set_gpio_as_cs(struct mcp2210 *mcp2210, u8 cs)
 {
+	struct mcp2210_gpio_settings_report *rep =
+		(struct mcp2210_gpio_settings_report*)mcp2210->out_buf;
+	int ret;
+
+	rep->id = MCP2210_GET_CHIP_SETTINGS;
+	ret = mcp2210_send_report(mcp2210);
+	if (ret)
+		return ret;
+
+	memcpy(rep, mcp2210->in_buf, MCP2210_REPORT_SIZE);
+	rep->id = MCP2210_SET_CHIP_SETTINGS;
+	rep->pinconf[cs] = MCP2210_PINCONF_CS;
+	ret = mcp2210_send_report(mcp2210);
+
+	return ret;
 }
 
 static int mcp2210_spi_setup(struct spi_device *spi)
@@ -72,16 +159,18 @@ static int mcp2210_spi_setup(struct spi_device *spi)
 		hid_err(mcp2210->hdev, "chip-select already in use\n");
 		ret = -EINVAL;
 	}
-	mutex_unlock(&mcp2210->lock);
 
 exit:
+	mutex_unlock(&mcp2210->lock);
 	return ret;
 }
 
 static void mcp2210_spi_cleanup(struct spi_device *spi)
 {
+	struct mcp2210 *mcp2210 = spi_master_get_devdata(spi->master);
+
 	mutex_lock(&mcp2210->lock);
-	mcp2210->requested_gpio_pins &= ~BIT(cs);
+	mcp2210->requested_gpio_pins &= ~BIT(spi->chip_select);
 	mutex_unlock(&mcp2210->lock);
 	spi->controller_state = NULL;
 }
@@ -90,44 +179,60 @@ static int mcp2210_spi_prepare_message(struct spi_master *master,
 				       struct spi_message *message)
 {
 	struct mcp2210 *mcp2210 = spi_master_get_devdata(master);
+	struct mcp2210_spi_settings_report *rep =
+		(struct mcp2210_spi_settings_report*)mcp2210->out_buf;
 	struct spi_device *spi = message->spi;
-	u16 idle_cs_val;
-	u16 active_cs_val;
-	u16 bytes_to_tx;
-	u32 bit_rate;
-	u8 spi_mode;
+	u16 bytes_to_tx = message->frame_length;
+	u32 bit_rate = spi->max_speed_hz;
+	u8 cs = spi->chip_select;
+	u16 mode = spi->mode;
 	int ret;
-	u8 cs;
 
-	spi_mode = spi->mode;
-	cs = spi->chip_select;
-	bit_rate = spi->max_speed_hz;
-	bytes_to_tx = message->frame_length;
+	if (bytes_to_tx > MCP2210_SPI_MAX_TRANSLEN) {
+		dev_err(&spi->dev, "Message is too long (%d)\n",
+			message->frame_length);
+		return -EINVAL;
+	}
 
 	mutex_lock(&mcp2210->lock);
-	memset(mcp2210->out_buf, 0, mcp2210->out_buf_size);
-	mcp2210->out_buf[0] = MCP2210_SET_SPI_SETTINGS;
-	mcp2210->out_buf[4] = (bit_rate >> 24) & 0xff;
-	mcp2210->out_buf[5] = (bit_rate >> 16) & 0xff;
-	mcp2210->out_buf[6] = (bit_rate >> 8) & 0xff;
-	mcp2210->out_buf[7] = bit_rate & 0xff;
-	mcp2210->out_buf[8] = 0xff;
-	mcp2210->out_buf[9] = 0xff;
-	mcp2210->out_buf[10] = ~BIT(cs) & 0xff;
-	mcp2210->out_buf[11] = ~BIT(cs) & 0xff;
-	mcp2210->out_buf[18] = bytes_to_tx & 0xff;
-	mcp2210->out_buf[19] = (bytes_to_tx >> 8) & 0xff;
-	mcp2210->out_buf[20] = spi_mode * 0xff;
-	mcp2210_send_report(mcp2210);
+	memset(rep, 0, MCP2210_REPORT_SIZE);
+	rep->id = MCP2210_SET_SPI_SETTINGS;
+	rep->bit_rate = __cpu_to_le32(bit_rate);
+	rep->idle_cs_value |= !(mode & SPI_CS_HIGH) << cs;
+	rep->active_cs_value |= (mode & SPI_CS_HIGH) << cs;
+	rep->bytes_to_tx = __cpu_to_le16(bytes_to_tx);
+	rep->mode = mode & 0x3;
+	ret = mcp2210_send_report(mcp2210);
 	mutex_unlock(&mcp2210->lock);
+
+	return ret;
+}
+
+static int mcp2210_spi_transfer_one(struct spi_master *master,
+				    struct spi_device *spi,
+				    struct spi_transfer *xfer)
+{
+	struct mcp2210 *mcp2210 = spi_master_get_devdata(master);
+	struct mcp2210_spi_transfer_report *rep =
+		(struct mcp2210_spi_transfer_report*)mcp2210->out_buf;
+	u8 spi_tx_len;
+
+	spi_tx_len = xfer->len >= MCP2210_SPI_MAX_XFERLEN ?
+			MCP2210_SPI_MAX_XFERLEN : xfer->len;
+	mcp2210->xfer = xfer;
+	mcp2210->xfer_remain = xfer->len - spi_tx_len;
+	/* mutex will be unlocked later on */
+	mutex_lock(&mcp2210->lock);
+	rep->id = MCP2210_SPI_TRANSFER;
+	rep->len = spi_tx_len;
+	memcpy(rep->data, xfer->tx_buf, spi_tx_len);
+
+	return 1;
 }
 
 static int mcp2210_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 {
 	struct mcp2210 *mcp2210 = gpiochip_get_data(chip);
-	struct hid_device *hdev = mcp2210->hdev;
-	u8 *buf = mcp2210->in_out_buffer;
-	int ret;
 
 	mutex_lock(&mcp2210->lock);
 	mutex_unlock(&mcp2210->lock);
@@ -137,9 +242,6 @@ static int mcp2210_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 static void mcp2210_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 {
 	struct mcp2210 *mcp2210 = gpiochip_get_data(chip);
-	struct hid_device *hdev = mcp2210->hdev;
-	u8 *buf = mcp2210->in_out_buffer;
-	int ret;
 
 	mutex_lock(&mcp2210->lock);
 	mutex_unlock(&mcp2210->lock);
@@ -148,14 +250,11 @@ static void mcp2210_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 static int mcp2210_gpio_get_all(struct gpio_chip *chip)
 {
 	struct mcp2210 *mcp2210 = gpiochip_get_data(chip);
-	struct hid_device *hdev = mcp2210->hdev;
-	u8 *buf = mcp2210->in_out_buffer;
-	int ret;
 
 	mutex_lock(&mcp2210->lock);
 	mutex_unlock(&mcp2210->lock);
 
-	return ret;
+	return 0;
 }
 
 static int mcp2210_gpio_get(struct gpio_chip *chip, unsigned int offset)
@@ -173,9 +272,6 @@ static int mcp2210_gpio_direction_output(struct gpio_chip *chip,
 					unsigned offset, int value)
 {
 	struct mcp2210 *mcp2210 = gpiochip_get_data(chip);
-	struct hid_device *hdev = mcp2210->hdev;
-	u8 *buf = mcp2210->in_out_buffer;
-	int ret;
 
 	mutex_lock(&mcp2210->lock);
 	mutex_unlock(&mcp2210->lock);
@@ -183,12 +279,12 @@ static int mcp2210_gpio_direction_output(struct gpio_chip *chip,
 	return 0;
 }
 
-static int mcp2210_probe(struct hid_device *hdev, const struct hid_device_id *id)
+static int mcp2210_probe(struct hid_device *hdev,
+			 const struct hid_device_id *id)
 {
 	struct list_head *report_list =
 		&hdev->report_enum[HID_OUTPUT_REPORT].report_list;
 	struct mcp2210 *mcp2210;
-	s32 *buf;
 	int ret;
 
 	mcp2210 = devm_kzalloc(&hdev->dev, sizeof(*mcp2210), GFP_KERNEL);
@@ -200,9 +296,8 @@ static int mcp2210_probe(struct hid_device *hdev, const struct hid_device_id *id
 		return -ENOMEM;
 
 	mutex_init(&mcp2210->lock);
-	init_waitqueue_head(&mcp2210->wait);
+	init_completion(&mcp2210->report_completion);
 	hid_set_drvdata(hdev, mcp2210);
-	atomic_set(&mcp2210->transfer_pending, 0);
 
 	ret = hid_parse(hdev);
 	if (ret) {
@@ -234,9 +329,9 @@ static int mcp2210_probe(struct hid_device *hdev, const struct hid_device_id *id
 		ret = -ENODEV;
 		goto err_power_normal;
 	}
-	mcp2210->out_buf = report->field[0]->value;
-	mcp2210->out_buf_size = report->field[0]->report_count *
-				report_enum->field[0]->report_size;
+	mcp2210->out_buf = mcp2210->report->field[0]->value;
+	mcp2210->out_buf_size = mcp2210->report->field[0]->report_count *
+				mcp2210->report->field[0]->report_size;
 
 	mcp2210->spi_master->num_chipselect = MCP2210_NUM_GPIOS;
 	mcp2210->spi_master->bus_num = -1;
@@ -247,7 +342,7 @@ static int mcp2210_probe(struct hid_device *hdev, const struct hid_device_id *id
 	mcp2210->spi_master->cleanup = mcp2210_spi_cleanup;
 	mcp2210->spi_master->prepare_message = mcp2210_spi_prepare_message;
 	mcp2210->spi_master->transfer_one = mcp2210_spi_transfer_one;
-	ret = devm_spi_register_master(&hdev->dev, mcp2210->master);
+	ret = devm_spi_register_master(&hdev->dev, mcp2210->spi_master);
 	if (ret) {
 		hid_err(hdev, "failed to register spi master\n");
 		goto err_power_normal;
@@ -261,9 +356,12 @@ static int mcp2210_probe(struct hid_device *hdev, const struct hid_device_id *id
 	mcp2210->gc.base = -1;
 	mcp2210->gc.ngpio = MCP2210_NUM_GPIOS;
 	mcp2210->gc.can_sleep = 1;
-	mcp2210->gc.parent = &hdev->dev;
 
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,6,0)
+	ret = gpiochip_add(&mcp2210->gc);
+#else
 	ret = gpiochip_add_data(&mcp2210->gc, mcp2210);
+#endif
 	if (ret < 0) {
 		hid_err(hdev, "error registering gpio chip\n");
 		goto err_power_normal;
@@ -298,8 +396,30 @@ static int mcp2210_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 	switch(data[0]) {
 	case MCP2210_SET_SPI_SETTINGS:
+	case MCP2210_SET_CHIP_SETTINGS:
+		mcp2210->report_status = data[1];
+		complete(&mcp2210->report_completion);
+		break;
+	case MCP2210_GET_SPI_SETTINGS:
+	case MCP2210_GET_CHIP_SETTINGS:
+		mcp2210->report_status = data[1];
 		memcpy(mcp2210->in_buf, data, size);
-		wake_up_interruptible(&mcp2210->wait);
+		complete(&mcp2210->report_completion);
+		break;
+	case MCP2210_SPI_TRANSFER:
+		if (data[1] == MCP2210_STATUS_BUS_NOT_AVAILABLE) {
+			/* resend report */
+			mcp2210_send_report_noblock(mcp2210);
+			hid_info(hdev, "spi bus not available\n");
+		} else if (data[1] == MCP2210_STATUS_TX_IN_PROGRESS){
+			/* something very wrong happened we cancel the transfer*/
+			hid_err(hdev, "spi transfer not properly configured\n");
+			spi_finalize_current_transfer(mcp2210->spi_master);
+		} else {
+			/* the data was accepted */
+			hid_info(hdev, "data accepted status=%d\n", data[3]);
+		}
+
 		break;
 	default:
 		hid_err(hdev, "Unexpected id report %d\n", data[0]);
@@ -326,6 +446,4 @@ static struct hid_driver mcp2210_driver = {
 module_hid_driver(mcp2210_driver);
 MODULE_DESCRIPTION("mcp2210 HID to SPI/GPIO driver");
 MODULE_AUTHOR("Nicolas Saenz Julienne <nicolassaenzj@gmail.com>");
-MODULE_AUTHOR("Daniel Pérez de Andrés <>");
 MODULE_LICENSE("GPL");
-
