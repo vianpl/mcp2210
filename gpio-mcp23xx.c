@@ -49,6 +49,7 @@ static int mcp23xx_get_value(struct gpio_chip *gc, unsigned offset)
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
 	unsigned int val;
 
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_read(mcp23xx->regmap, MCP23XX_REG_GPIO, &val);
 
 	return !!(val & offset);
@@ -59,6 +60,7 @@ static void mcp23xx_set_value(struct gpio_chip *gc,
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
 
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_GPIO, 1 << offset, val);
 }
 
@@ -67,6 +69,7 @@ static void mcp23xx_set_multiple(struct gpio_chip *gc, unsigned long *mask,
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
 
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_GPIO, *mask, *bits);
 }
 
@@ -75,7 +78,9 @@ static int mcp23xx_direction_output(struct gpio_chip *gc,
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
 
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_IODIR, 1 << offset, 0);
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_GPIO, 1 << offset, val);
 	return 0;
 }
@@ -85,6 +90,7 @@ static int mcp23xx_direction_input(struct gpio_chip *gc,
 {
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
 
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_update_bits(mcp23xx->regmap, MCP23XX_REG_IODIR, 1 << offset, 1);
 	return 0;
 }
@@ -94,6 +100,7 @@ static int mcp23xx_get_direction(struct gpio_chip *gc, unsigned int offset)
 	struct mcp23xx *mcp23xx = gpiochip_get_data(gc);
 	unsigned int val;
 
+	pr_info("%s, %d\n", __func__, __LINE__);
 	regmap_read(mcp23xx->regmap, MCP23XX_REG_IODIR, &val);
 
 	return !!(val & (1 << offset));
@@ -151,6 +158,8 @@ static int mcp23xx_probe(struct spi_device *spi)
 	mcp23xx = devm_kzalloc(&spi->dev, sizeof(*mcp23xx), GFP_KERNEL);
 	if (!mcp23xx)
 		return -ENOMEM;
+
+	spi_set_drvdata(spi, mcp23xx);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
 	mcp23xx->gc.parent = &spi->dev;

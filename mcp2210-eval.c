@@ -10,18 +10,13 @@
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.
  */
-
 #include <linux/module.h>
-#include <linux/err.h>
-#include <linux/platform_device.h>
-#include <linux/i2c.h>
-#include <linux/spi/spi.h>
-#include <linux/spi/flash.h>
-#include <linux/mtd/partitions.h>
-#include <linux/mtd/mtd.h>
 #include <linux/delay.h>
+#include <linux/spi/spi.h>
+#include <linux/platform_device.h>
 
-#define DRIVER_NAME				"mcp2210-eval"
+#define DRIVER_NAME			"mcp2210-eval"
+#define MCP2210_EVAL_SPI_BUS_NUM	33
 
 struct mcp2210_eval {
 	struct platform_device *pdev;
@@ -29,45 +24,17 @@ struct mcp2210_eval {
 	struct spi_master *spi_master;
 };
 
-static struct spi_board_ifo mcp2210_eval_spi_board = {
+static struct spi_board_info mcp2210_eval_spi_board = {
 	.modalias = "mcp23s08",
 	.max_speed_hz = 1000 * 1000,
-	.chip_select = 0,
+	.chip_select = 4,
 	.mode = SPI_MODE_0,
 };
 
-static ssize_t fpga_mtd_store(struct device *dev,
-			      struct device_attribute *attr,
-			      const char *buf, size_t len)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct mcp2210_eval *mcp2210_eval = platform_get_drvdata(pdev);
-	int ret;
-
-	} else if (*buf == '0') {
-		if (!mcp2210_eval->i2c_adapter)
-			return -EINVAL;
-
-		ret = fpga_set_mtd_access(mcp2210_eval, 0);
-		if (ret) {
-			return ret;
-			dev_err(&pdev->dev, "Failed to disable spi access\n");
-		}
-
-		spi_unregister_device(mcp2210_eval->spi_device);
-		i2c_unregister_device(mcp2210_eval->i2c_client);
-		mcp2210_eval->i2c_adapter = NULL;
-	} else {
-		return -EINVAL;
-	}
-
-	return len;
-}
-
+struct spi_device *nico_spi_device;
 static int mcp2210_eval_probe(struct platform_device *pdev)
 {
 	struct mcp2210_eval *mcp2210_eval;
-	int ret;
 
 	mcp2210_eval = devm_kzalloc(&pdev->dev, sizeof(*mcp2210_eval), GFP_KERNEL);
 	if (!mcp2210_eval) {
@@ -84,11 +51,21 @@ static int mcp2210_eval_probe(struct platform_device *pdev)
 	}
 
 	mcp2210_eval->spi_device = spi_new_device(mcp2210_eval->spi_master,
-					      &mcp2210_eval_spi_board);
+					          &mcp2210_eval_spi_board);
+	nico_spi_device = mcp2210_eval->spi_device;
 	if (!mcp2210_eval->spi_device) {
 		dev_err(&pdev->dev, "unable to create SPI device\n");
 		return -EINVAL;
 	}
+
+	return 0;
+}
+
+int mcp2210_eval_remove(struct platform_device *pdev)
+{
+	struct mcp2210_eval *mcp2210_eval = platform_get_drvdata(pdev);
+
+	spi_unregister_device(nico_spi_device);
 
 	return 0;
 }
@@ -98,6 +75,7 @@ static struct platform_driver pdriv = {
 		.name = DRIVER_NAME,
 	},
 	.probe = mcp2210_eval_probe,
+	.remove = mcp2210_eval_remove,
 };
 
 static struct platform_device *pdev;

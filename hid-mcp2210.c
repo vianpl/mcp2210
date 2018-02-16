@@ -6,6 +6,7 @@
 #include <linux/hid.h>
 #include <linux/spi/spi.h>
 #include <linux/gpio/driver.h>
+#include <linux/delay.h>
 #include "linux-mainline/drivers/hid/hid-ids.h"
 
 #define USB_DEVICE_ID_MCP2210			0x00de
@@ -26,7 +27,7 @@ enum {
 
 enum {
 	MCP2210_STATUS_COMMAND_COMPLETED = 0x00,
-	MCP2210_STATUS_BUS_NOT_AVAILABLE = 0xF8,
+	MCP2210_STATUS_BUS_NOT_AVAILABLE = 0xF7,
 	MCP2210_STATUS_TX_IN_PROGRESS = 0xF8,
 };
 
@@ -86,35 +87,42 @@ struct mcp2210 {
 	s32 *out_buf;
 	size_t out_buf_size;
 	char in_buf[64];
+	char *rx_buf;
 
 	u16 requested_gpio_pins;
 	struct completion report_completion;
-	struct spi_transfer *xfer;
-	u16 xfer_remain;
+	u16 tx_offset;
 	u8 report_status;
+	unsigned int tx_sent;
+	unsigned int rx_offset;
+
+	unsigned int last_len;
+	bool spi_busy;
+	bool write_enabled;
+	bool message_bypass;
+	unsigned int discount;
 };
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,6,0)
 #define gpiochip_get_data(__gc)		container_of(__gc, struct mcp2210, gc)
 #endif
 
-static int __mcp2210_send_report(struct mcp2210 *mcp2210, bool block)
+static int mcp2210_send_report(struct mcp2210 *mcp2210)
 {
 	int ret;
 
-	hid_hw_request(mcp2210->hdev, mcp2210->report, HID_REQ_SET_REPORT);
-	if (block) {
-		ret = wait_for_completion_timeout(&mcp2210->report_completion,
-						  msecs_to_jiffies(100));
-		if (!ret)
-			return -ETIMEDOUT;
-	}
+	print_hex_dump(KERN_INFO, "raw event data out: ", DUMP_PREFIX_OFFSET, 16, 1,
+					 mcp2210->out_buf, MCP2210_REPORT_SIZE, true);
+
+	hid_hw_output_report(mcp2210->hdev, mcp2210->out_buf, MCP2210_REPORT_SIZE);
+
+	ret = wait_for_completion_timeout(&mcp2210->report_completion,
+						msecs_to_jiffies(100));
+	if (!ret)
+		return -ETIMEDOUT;
 
 	return 0;
 }
-#define mcp2210_send_report(__mcp2210)	__mcp2210_send_report(__mcp2210, true)
-#define mcp2210_send_report_noblock(__mcp2210) \
-					__mcp2210_send_report(__mcp2210, false)
 
 static int mcp2210_set_gpio_as_cs(struct mcp2210 *mcp2210, u8 cs)
 {
@@ -137,14 +145,12 @@ static int mcp2210_set_gpio_as_cs(struct mcp2210 *mcp2210, u8 cs)
 
 static int mcp2210_spi_setup(struct spi_device *spi)
 {
-	struct mcp2210 *mcp2210;
+	struct mcp2210 *mcp2210 = spi_master_get_devdata(spi->master);
+	u8 cs = spi->chip_select;
 	int ret = 0;
-	u8 cs;
 
-	mcp2210 = spi_master_get_devdata(spi->master);
 	if (!spi->controller_state)
 		spi->controller_state = mcp2210;
-	cs = spi->chip_select;
 
 	mutex_lock(&mcp2210->lock);
 	if (!(mcp2210->requested_gpio_pins & BIT(cs))) {
@@ -175,6 +181,42 @@ static void mcp2210_spi_cleanup(struct spi_device *spi)
 	spi->controller_state = NULL;
 }
 
+static int mcp2210_bypass_message(struct mcp2210 *mcp2210,
+				  struct spi_message *message)
+{
+	struct spi_transfer *t =
+		list_first_entry(&message->transfers, struct spi_transfer, transfer_list);
+
+	/* SPI memory Write Enable bypass: no hace falta hacer un enable de write a
+	 * la memoria cada vez que ecribimos un bloque siempre y cuando nadie haya
+	 * desactivado el enable (que no lo hace nadie...)
+	 */
+	if (message->frame_length == 1 && t->tx_buf && ((char*)t->tx_buf)[0] == 0x06) {
+		hid_info(mcp2210->hdev, "write enable!\n");
+		if (mcp2210->write_enabled) {
+			mcp2210->message_bypass = true;
+			return 1;
+		}
+
+		mcp2210->write_enabled = true;
+	/* SPI write check bypass: perdemos unos 8ms por escritura verificando que la
+	 * memoria SPI ha copiado todo correctamente, la memoria va a 1MBs mientras
+	 * que nosotros siempre iremos <20KBs por lo jodidamente lento que es el
+	 * mcp2210 (una escritura SPI de 1 bit tarda 2ms), no hace falta esa
+	 * verificación.
+	 */
+	} else if (message->frame_length == 2 && t->tx_buf && t->len == 1 &&
+		   ((char*)t->tx_buf)[0] == 0x05) {
+		hid_info(mcp2210->hdev, "write check bypass!!\n");
+			mcp2210->message_bypass = true;
+			return 1;
+	}
+
+	mcp2210->message_bypass = false;
+
+	return 0;
+}
+
 static int mcp2210_spi_prepare_message(struct spi_master *master,
 				       struct spi_message *message)
 {
@@ -186,13 +228,18 @@ static int mcp2210_spi_prepare_message(struct spi_master *master,
 	u32 bit_rate = spi->max_speed_hz;
 	u8 cs = spi->chip_select;
 	u16 mode = spi->mode;
-	int ret;
+	int ret = 0;
+
+	hid_info(mcp2210->hdev, "Message length %d\n", bytes_to_tx);
 
 	if (bytes_to_tx > MCP2210_SPI_MAX_TRANSLEN) {
 		dev_err(&spi->dev, "Message is too long (%d)\n",
 			message->frame_length);
 		return -EINVAL;
 	}
+
+	if (mcp2210_bypass_message(mcp2210, message))
+		return 0;
 
 	mutex_lock(&mcp2210->lock);
 	memset(rep, 0, MCP2210_REPORT_SIZE);
@@ -202,32 +249,74 @@ static int mcp2210_spi_prepare_message(struct spi_master *master,
 	rep->active_cs_value |= (mode & SPI_CS_HIGH) << cs;
 	rep->bytes_to_tx = __cpu_to_le16(bytes_to_tx);
 	rep->mode = mode & 0x3;
-	ret = mcp2210_send_report(mcp2210);
+	if (mcp2210->last_len != bytes_to_tx) {
+		hid_info(mcp2210->hdev, "spi config\n");
+		ret = mcp2210_send_report(mcp2210);
+	} else {
+		hid_info(mcp2210->hdev, "bypass spi config\n");
+	}
+	mcp2210->last_len = bytes_to_tx;
 	mutex_unlock(&mcp2210->lock);
 
 	return ret;
 }
 
 static int mcp2210_spi_transfer_one(struct spi_master *master,
-				    struct spi_device *spi,
-				    struct spi_transfer *xfer)
+				    struct spi_device *dev,
+				    struct spi_transfer *t)
 {
 	struct mcp2210 *mcp2210 = spi_master_get_devdata(master);
 	struct mcp2210_spi_transfer_report *rep =
 		(struct mcp2210_spi_transfer_report*)mcp2210->out_buf;
-	u8 spi_tx_len;
+	unsigned int len;
 
-	spi_tx_len = xfer->len >= MCP2210_SPI_MAX_XFERLEN ?
-			MCP2210_SPI_MAX_XFERLEN : xfer->len;
-	mcp2210->xfer = xfer;
-	mcp2210->xfer_remain = xfer->len - spi_tx_len;
-	/* mutex will be unlocked later on */
+	hid_info(mcp2210->hdev, "transfer... len %d\n", t->len);
+
+	if (mcp2210->message_bypass) {
+		hid_info(mcp2210->hdev, "message bypass!!\n");
+		return 0;
+	}
+
 	mutex_lock(&mcp2210->lock);
-	rep->id = MCP2210_SPI_TRANSFER;
-	rep->len = spi_tx_len;
-	memcpy(rep->data, xfer->tx_buf, spi_tx_len);
+	mcp2210->rx_offset = 0;
+	mcp2210->tx_sent = 0;
+	mcp2210->rx_buf = t->rx_buf;
+	len = 0;
 
-	return 1;
+	while (mcp2210->rx_offset < t->len)
+	{
+		/* Si el core SPI pasa de la respuesta del mensaje pasamos nosotros tambien */
+		if (!mcp2210->rx_buf && mcp2210->tx_sent == t->len && !mcp2210->spi_busy) {
+			mcp2210->discount = t->len - mcp2210->rx_offset;
+			break;
+		}
+
+		if (((!mcp2210->rx_buf && !mcp2210->spi_busy) || mcp2210->rx_offset == mcp2210->tx_sent) &&
+		    mcp2210->tx_sent < t->len) {
+			len = t->len - mcp2210->tx_sent;
+			if (len > MCP2210_SPI_MAX_XFERLEN)
+				len = MCP2210_SPI_MAX_XFERLEN;
+
+			if (t->tx_buf)
+				memcpy(rep->data, t->tx_buf + mcp2210->tx_sent, len);
+
+			mcp2210->tx_sent += len;
+		} else if (!mcp2210->spi_busy) {
+			len = 0;
+		}
+
+		mcp2210->spi_busy = false;
+
+		rep->id = MCP2210_SPI_TRANSFER;
+		rep->len = len;
+		hid_info(mcp2210->hdev, "ID 0x%x, num bits %d", rep->id, rep->len);
+		mcp2210_send_report(mcp2210);
+	}
+	mutex_unlock(&mcp2210->lock);
+
+	hid_info(mcp2210->hdev, "done...\n");
+
+	return 0;
 }
 
 static int mcp2210_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
@@ -287,6 +376,7 @@ static int mcp2210_probe(struct hid_device *hdev,
 	struct mcp2210 *mcp2210;
 	int ret;
 
+	hid_info(hdev, "entering probe!!!\n");
 	mcp2210 = devm_kzalloc(&hdev->dev, sizeof(*mcp2210), GFP_KERNEL);
 	if (!mcp2210)
 		return -ENOMEM;
@@ -298,6 +388,7 @@ static int mcp2210_probe(struct hid_device *hdev,
 	mutex_init(&mcp2210->lock);
 	init_completion(&mcp2210->report_completion);
 	hid_set_drvdata(hdev, mcp2210);
+	mcp2210->hdev = hdev;
 
 	ret = hid_parse(hdev);
 	if (ret) {
@@ -329,12 +420,13 @@ static int mcp2210_probe(struct hid_device *hdev,
 		ret = -ENODEV;
 		goto err_power_normal;
 	}
+
 	mcp2210->out_buf = mcp2210->report->field[0]->value;
 	mcp2210->out_buf_size = mcp2210->report->field[0]->report_count *
 				mcp2210->report->field[0]->report_size;
 
 	mcp2210->spi_master->num_chipselect = MCP2210_NUM_GPIOS;
-	mcp2210->spi_master->bus_num = -1;
+	mcp2210->spi_master->bus_num = 34;
 	mcp2210->spi_master->mode_bits = SPI_CPOL | SPI_CPHA;
 	mcp2210->spi_master->max_speed_hz = MCP2210_SPI_MAX_SPEED;
 	mcp2210->spi_master->min_speed_hz = MCP2210_SPI_MIN_SPEED;
@@ -342,6 +434,7 @@ static int mcp2210_probe(struct hid_device *hdev,
 	mcp2210->spi_master->cleanup = mcp2210_spi_cleanup;
 	mcp2210->spi_master->prepare_message = mcp2210_spi_prepare_message;
 	mcp2210->spi_master->transfer_one = mcp2210_spi_transfer_one;
+	spi_master_set_devdata(mcp2210->spi_master, mcp2210);
 	ret = devm_spi_register_master(&hdev->dev, mcp2210->spi_master);
 	if (ret) {
 		hid_err(hdev, "failed to register spi master\n");
@@ -366,6 +459,7 @@ static int mcp2210_probe(struct hid_device *hdev,
 		hid_err(hdev, "error registering gpio chip\n");
 		goto err_power_normal;
 	}
+	hid_info(hdev, "MCP2210 USB/SPI driver registered");
 
 	return 0;
 
@@ -391,8 +485,8 @@ static int mcp2210_raw_event(struct hid_device *hdev, struct hid_report *report,
 {
 	struct mcp2210 *mcp2210 = hid_get_drvdata(hdev);
 
-	print_hex_dump(KERN_INFO, "raw event data: ", DUMP_PREFIX_OFFSET, 16, 1,
-		       data, size, true);
+	print_hex_dump(KERN_INFO, "raw event data in: ", DUMP_PREFIX_OFFSET, 16, 1,
+					 data, size, true);
 
 	switch(data[0]) {
 	case MCP2210_SET_SPI_SETTINGS:
@@ -407,17 +501,29 @@ static int mcp2210_raw_event(struct hid_device *hdev, struct hid_report *report,
 		complete(&mcp2210->report_completion);
 		break;
 	case MCP2210_SPI_TRANSFER:
-		if (data[1] == MCP2210_STATUS_BUS_NOT_AVAILABLE) {
+		if (data[1] == MCP2210_STATUS_TX_IN_PROGRESS) {
 			/* resend report */
-			mcp2210_send_report_noblock(mcp2210);
 			hid_info(hdev, "spi bus not available\n");
-		} else if (data[1] == MCP2210_STATUS_TX_IN_PROGRESS){
+			mcp2210->spi_busy = true;
+			complete(&mcp2210->report_completion);
+		} else if (data[1] == MCP2210_STATUS_BUS_NOT_AVAILABLE) {
 			/* something very wrong happened we cancel the transfer*/
 			hid_err(hdev, "spi transfer not properly configured\n");
-			spi_finalize_current_transfer(mcp2210->spi_master);
 		} else {
 			/* the data was accepted */
-			hid_info(hdev, "data accepted status=%d\n", data[3]);
+			hid_info(hdev, "ID 0x%x, Status 0x%x, num bits %d", data[0], data[3], data[2]);
+			if (data[2]) {
+				if (mcp2210->discount) {
+					mcp2210->discount = 0;
+				} else {
+					if (mcp2210->rx_buf) {
+						memcpy(mcp2210->rx_buf + mcp2210->rx_offset, &data[4], data[2]);
+					}
+					mcp2210->rx_offset += data[2];
+				}
+			}
+
+			complete(&mcp2210->report_completion);
 		}
 
 		break;
