@@ -14,9 +14,11 @@
 #include <linux/delay.h>
 #include <linux/spi/spi.h>
 #include <linux/platform_device.h>
+#include "mcp23xx.h"
 
 #define DRIVER_NAME			"mcp2210-eval"
-#define MCP2210_EVAL_SPI_BUS_NUM	33
+#define MCP2210_EVAL_SPI_BUS_NUM	34
+#define MCP23S08_ADDRESS		0x50
 
 struct mcp2210_eval {
 	struct platform_device *pdev;
@@ -24,14 +26,19 @@ struct mcp2210_eval {
 	struct spi_master *spi_master;
 };
 
+
+static struct mcp23xx_platform_data mcp23xx_pdata = {
+	.address = MCP23S08_ADDRESS,
+};
+
 static struct spi_board_info mcp2210_eval_spi_board = {
 	.modalias = "mcp23s08",
 	.max_speed_hz = 1000 * 1000,
 	.chip_select = 4,
 	.mode = SPI_MODE_0,
+	.platform_data = &mcp23xx_pdata,
 };
 
-struct spi_device *nico_spi_device;
 static int mcp2210_eval_probe(struct platform_device *pdev)
 {
 	struct mcp2210_eval *mcp2210_eval;
@@ -52,11 +59,12 @@ static int mcp2210_eval_probe(struct platform_device *pdev)
 
 	mcp2210_eval->spi_device = spi_new_device(mcp2210_eval->spi_master,
 					          &mcp2210_eval_spi_board);
-	nico_spi_device = mcp2210_eval->spi_device;
 	if (!mcp2210_eval->spi_device) {
 		dev_err(&pdev->dev, "unable to create SPI device\n");
 		return -EINVAL;
 	}
+
+	dev_info(&pdev->dev, "mcp2210 evaluation board driver loaded\n");
 
 	return 0;
 }
@@ -65,7 +73,7 @@ int mcp2210_eval_remove(struct platform_device *pdev)
 {
 	struct mcp2210_eval *mcp2210_eval = platform_get_drvdata(pdev);
 
-	spi_unregister_device(nico_spi_device);
+	spi_unregister_device(mcp2210_eval->spi_device);
 
 	return 0;
 }
@@ -101,8 +109,6 @@ static int mcp2210_eval_init(void)
 	ret = platform_device_add(pdev);
 	if (ret)
 		goto fail_platform_device2;
-
-	pr_info("iksunet2-platform driver loaded\n");
 
 	return 0;
 
