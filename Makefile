@@ -8,8 +8,8 @@ KERNEL_SRC ?= /lib/modules/`uname -r`/build
 default:
 	$(MAKE) -C $(KERNEL_SRC) M=$$PWD
 
-install:
-	$(MAKE) -C $(KERNEL_SRC) M=$$PWD install
+modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$$PWD modules_install
 
 clean:
-	rm -rf   Module.symvers modules.order *.o *.ko *.mod.c
+	$(MAKE) -C $(KERNEL_SRC) M=$$PWD clean

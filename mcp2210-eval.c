@@ -14,11 +14,10 @@
 #include <linux/delay.h>
 #include <linux/spi/spi.h>
 #include <linux/platform_device.h>
-#include "mcp23xx.h"
+#include <linux/spi/mcp23s08.h>
 
 #define DRIVER_NAME			"mcp2210-eval"
 #define MCP2210_EVAL_SPI_BUS_NUM	34
-#define MCP23S08_ADDRESS		0x50
 
 struct mcp2210_eval {
 	struct platform_device *pdev;
@@ -27,13 +26,14 @@ struct mcp2210_eval {
 };
 
 
-static struct mcp23xx_platform_data mcp23xx_pdata = {
-	.address = MCP23S08_ADDRESS,
+static struct mcp23s08_platform_data mcp23xx_pdata = {
+	.spi_present_mask = 0x1,
+	.base = -1,
 };
 
 static struct spi_board_info mcp2210_eval_spi_board = {
 	.modalias = "mcp23s08",
-	.max_speed_hz = 1000 * 1000,
+	.max_speed_hz = 500 * 1000,
 	.chip_select = 4,
 	.mode = SPI_MODE_0,
 	.platform_data = &mcp23xx_pdata,
