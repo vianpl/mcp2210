@@ -99,8 +99,8 @@ struct mcp2210 {
 
 	void *out_buf;
 	void *in_buf;
-	unsigned int report_size;
 	unsigned int total_sent;
+	unsigned int total_received;
 };
 
 static int mcp2210_send_report(struct mcp2210 *mcp2210)
@@ -197,8 +197,8 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 
 	hid_info(mcp2210->hdev, "transfer... len %d\n", t->len);
 
-	mcp2210->report_size = 0;
 	mcp2210->total_sent = 0;
+	mcp2210->total_received = 0;
 	memset(in_rep, 0, sizeof(*in_rep));
 	out_rep->id = MCP2210_SPI_TRANSFER;
 	mutex_lock(&mcp2210->lock);
@@ -209,11 +209,11 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 		case MCP2210_STATUS_COMMAND_COMPLETED:
 			/* the data was processed send more if available */
 			if (t->rx_buf && in_rep->data_len)
-				memcpy(t->rx_buf + mcp2210->total_sent,
+				memcpy(t->rx_buf + mcp2210->total_received,
 				       in_rep->data, in_rep->data_len);
 
-			mcp2210->total_sent += in_rep->data_len;
-			if (mcp2210->total_sent >= t->len) {
+			mcp2210->total_received += in_rep->data_len;
+			if (mcp2210->total_received >= t->len) {
 				hid_err(mcp2210->hdev, "done...\n");
 				mutex_unlock(&mcp2210->lock);
 				return 0;
@@ -223,6 +223,7 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 			out_rep->data_len = t->len - mcp2210->total_sent;
 			if (out_rep->data_len > MCP2210_SPI_MAX_XFERLEN)
 				out_rep->data_len = MCP2210_SPI_MAX_XFERLEN;
+			mcp2210->total_sent += out_rep->data_len;
 
 			/* populate hid report */
 			if (t->tx_buf)
@@ -236,11 +237,14 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 		case MCP2210_STATUS_BUS_NOT_AVAILABLE:
 			/* bus not available, that's an error, we exit */
 			hid_err(mcp2210->hdev, "SPI bus not available!\n");
+			mutex_unlock(&mcp2210->lock);
 			return -EINVAL;
 			break;
 		default:
 			/* per datasheet should never happen, we exit */
-			return -EINVAL;
+			hid_err(mcp2210->hdev, "unexpected value from chip!\n");
+			mutex_unlock(&mcp2210->lock);
+			return -EIO;
 			break;
 		}
 
