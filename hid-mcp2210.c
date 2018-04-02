@@ -93,7 +93,7 @@ struct mcp2210_spi_settings_report {
 
 struct mcp2210 {
 	struct hid_device *hdev;
-	struct spi_controller *spi_controller;
+	struct spi_controller *spi_master;
 	struct mutex lock;
 	struct completion report_completion;
 
@@ -107,7 +107,7 @@ static int mcp2210_send_report(struct mcp2210 *mcp2210)
 {
 	int ret;
 
-	print_hex_dump(KERN_INFO, "raw event data out: ", DUMP_PREFIX_OFFSET, 16, 1, mcp2210->out_buf, MCP2210_REPORT_SIZE, true);
+	//print_hex_dump(KERN_INFO, "raw event data out: ", DUMP_PREFIX_OFFSET, 16, 1, mcp2210->out_buf, MCP2210_REPORT_SIZE, true);
 	hid_hw_output_report(mcp2210->hdev, mcp2210->out_buf,
 			     MCP2210_REPORT_SIZE);
 	ret = wait_for_completion_timeout(&mcp2210->report_completion,
@@ -196,10 +196,10 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 	struct mcp2210_response_report *in_rep = mcp2210->in_buf;
 
 	hid_info(mcp2210->hdev, "transfer... len %d\n", t->len);
-
 	mcp2210->total_sent = 0;
 	mcp2210->total_received = 0;
 	memset(in_rep, 0, sizeof(*in_rep));
+	in_rep->status = MCP2210_STATUS_COMMAND_COMPLETED;
 	out_rep->id = MCP2210_SPI_TRANSFER;
 	mutex_lock(&mcp2210->lock);
 	while (true)
@@ -207,33 +207,34 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 		hid_info(mcp2210->hdev, "in_rep->len %d, mcp2210->total_sent %d, t->rx_buf %p, t->tx_buf %p\n", in_rep->data_len, mcp2210->total_sent, t->rx_buf, t->tx_buf);
 		switch (in_rep->status) {
 		case MCP2210_STATUS_COMMAND_COMPLETED:
-			/* the data was processed send more if available */
+			/* first we copy the received data, if any */
 			if (t->rx_buf && in_rep->data_len)
 				memcpy(t->rx_buf + mcp2210->total_received,
 				       in_rep->data, in_rep->data_len);
-
 			mcp2210->total_received += in_rep->data_len;
+
+			/* check if we sent the whole transfer already */
 			if (mcp2210->total_received >= t->len) {
-				hid_err(mcp2210->hdev, "done...\n");
 				mutex_unlock(&mcp2210->lock);
 				return 0;
 			}
 
-			/* calculate next report's size */
+			/* calculate the output report's size...*/
 			out_rep->data_len = t->len - mcp2210->total_sent;
 			if (out_rep->data_len > MCP2210_SPI_MAX_XFERLEN)
 				out_rep->data_len = MCP2210_SPI_MAX_XFERLEN;
-			mcp2210->total_sent += out_rep->data_len;
 
-			/* populate hid report */
+			/* ... and copy the data if relevant */
 			if (t->tx_buf)
 				memcpy(out_rep->data,
 				       t->tx_buf + mcp2210->total_sent,
 				       out_rep->data_len);
+			mcp2210->total_sent += out_rep->data_len;
+
 			break;
 		case MCP2210_STATUS_TX_IN_PROGRESS:
-			/* retry last command */
-				break;
+			/* chip busy, retry last report */
+			break;
 		case MCP2210_STATUS_BUS_NOT_AVAILABLE:
 			/* bus not available, that's an error, we exit */
 			hid_err(mcp2210->hdev, "SPI bus not available!\n");
@@ -249,6 +250,7 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 		}
 
 		hid_info(mcp2210->hdev, "ID 0x%x, num bits %d", out_rep->id, out_rep->data_len);
+		/* send the report and wait for a response */
 		mcp2210_send_report(mcp2210);
 	}
 }
@@ -270,8 +272,8 @@ static int mcp2210_probe(struct hid_device *hdev,
 	if (!mcp2210->in_buf || !mcp2210->out_buf)
 		return -ENOMEM;
 
-	mcp2210->spi_controller = spi_alloc_master(&hdev->dev, 0);
-	if (!mcp2210->spi_controller)
+	mcp2210->spi_master = spi_alloc_master(&hdev->dev, 0);
+	if (!mcp2210->spi_master)
 		return -ENOMEM;
 
 	mcp2210->hdev = hdev;
@@ -303,16 +305,16 @@ static int mcp2210_probe(struct hid_device *hdev,
 		goto err_hid_close;
 	}
 
-	mcp2210->spi_controller->num_chipselect = MCP2210_NUM_GPIOS;
-	mcp2210->spi_controller->bus_num = MCP2210_SPI_BUS_NUM;
-	mcp2210->spi_controller->mode_bits = SPI_CPOL | SPI_CPHA;
-	mcp2210->spi_controller->max_speed_hz = MCP2210_SPI_MAX_SPEED;
-	mcp2210->spi_controller->min_speed_hz = MCP2210_SPI_MIN_SPEED;
-	mcp2210->spi_controller->setup = mcp2210_spi_setup;
-	mcp2210->spi_controller->prepare_message = mcp2210_spi_prepare_message;
-	mcp2210->spi_controller->transfer_one = mcp2210_spi_transfer_one;
-	spi_controller_set_devdata(mcp2210->spi_controller, mcp2210);
-	ret = devm_spi_register_controller(&hdev->dev, mcp2210->spi_controller);
+	mcp2210->spi_master->num_chipselect = MCP2210_NUM_GPIOS;
+	mcp2210->spi_master->bus_num = MCP2210_SPI_BUS_NUM;
+	mcp2210->spi_master->mode_bits = SPI_CPOL | SPI_CPHA;
+	mcp2210->spi_master->max_speed_hz = MCP2210_SPI_MAX_SPEED;
+	mcp2210->spi_master->min_speed_hz = MCP2210_SPI_MIN_SPEED;
+	mcp2210->spi_master->setup = mcp2210_spi_setup;
+	mcp2210->spi_master->prepare_message = mcp2210_spi_prepare_message;
+	mcp2210->spi_master->transfer_one = mcp2210_spi_transfer_one;
+	spi_controller_set_devdata(mcp2210->spi_master, mcp2210);
+	ret = devm_spi_register_controller(&hdev->dev, mcp2210->spi_master);
 	if (ret) {
 		hid_err(hdev, "failed to register spi controller\n");
 		goto err_hid_close;
@@ -340,7 +342,7 @@ static int mcp2210_raw_event(struct hid_device *hdev, struct hid_report *report,
 {
 	struct mcp2210 *mcp2210 = hid_get_drvdata(hdev);
 
-	print_hex_dump(KERN_INFO, "raw event data in: ", DUMP_PREFIX_OFFSET, 16, 1, data, size, true);
+	//print_hex_dump(KERN_INFO, "raw event data in: ", DUMP_PREFIX_OFFSET, 16, 1, data, size, true);
 	memcpy(mcp2210->in_buf, data, size);
 	complete(&mcp2210->report_completion);
 
