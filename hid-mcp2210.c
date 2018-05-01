@@ -107,7 +107,7 @@ static int mcp2210_send_report(struct mcp2210 *mcp2210)
 {
 	int ret;
 
-	//print_hex_dump(KERN_INFO, "raw event data out: ", DUMP_PREFIX_OFFSET, 16, 1, mcp2210->out_buf, MCP2210_REPORT_SIZE, true);
+	print_hex_dump(KERN_INFO, "raw event data out: ", DUMP_PREFIX_OFFSET, 16, 1, mcp2210->out_buf, MCP2210_REPORT_SIZE, true);
 	hid_hw_output_report(mcp2210->hdev, mcp2210->out_buf,
 			     MCP2210_REPORT_SIZE);
 	ret = wait_for_completion_timeout(&mcp2210->report_completion,
@@ -142,6 +142,7 @@ static int mcp2210_spi_setup(struct spi_device *spi)
 	u8 cs = spi->chip_select;
 	int ret = 0;
 
+	hid_info(mcp2210->hdev, "chip select!!! %d\n", cs);
 	mutex_lock(&mcp2210->lock);
 	ret = mcp2210_set_gpio_as_cs(mcp2210, cs);
 	if (ret)
@@ -219,7 +220,7 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 				return 0;
 			}
 
-			/* calculate the output report's size...*/
+			/* calculate the next output report's size...*/
 			out_rep->data_len = t->len - mcp2210->total_sent;
 			if (out_rep->data_len > MCP2210_SPI_MAX_XFERLEN)
 				out_rep->data_len = MCP2210_SPI_MAX_XFERLEN;
@@ -342,7 +343,7 @@ static int mcp2210_raw_event(struct hid_device *hdev, struct hid_report *report,
 {
 	struct mcp2210 *mcp2210 = hid_get_drvdata(hdev);
 
-	//print_hex_dump(KERN_INFO, "raw event data in: ", DUMP_PREFIX_OFFSET, 16, 1, data, size, true);
+	print_hex_dump(KERN_INFO, "raw event data in: ", DUMP_PREFIX_OFFSET, 16, 1, data, size, true);
 	memcpy(mcp2210->in_buf, data, size);
 	complete(&mcp2210->report_completion);
 

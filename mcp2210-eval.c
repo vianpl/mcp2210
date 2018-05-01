@@ -25,13 +25,20 @@ struct mcp2210_eval {
 	struct spi_master *spi_master;
 };
 
+static struct spi_board_info tc77_temp = {
+	.modalias = "tc77",
+	.max_speed_hz = 5 * 1000 * 1000,
+	.chip_select = 7,
+	.mode = SPI_MODE_0,
+	.platform_data = NULL,
+};
 
 static struct mcp23s08_platform_data mcp23xx_pdata = {
 	.spi_present_mask = 0x1,
 	.base = -1,
 };
 
-static struct spi_board_info mcp2210_eval_spi_board = {
+static struct spi_board_info mcp23s08_gpio_expander = {
 	.modalias = "mcp23s08",
 	.max_speed_hz = 500 * 1000,
 	.chip_select = 4,
@@ -58,9 +65,16 @@ static int mcp2210_eval_probe(struct platform_device *pdev)
 	}
 
 	mcp2210_eval->spi_device = spi_new_device(mcp2210_eval->spi_master,
-					          &mcp2210_eval_spi_board);
+					          &mcp23s08_gpio_expander);
 	if (!mcp2210_eval->spi_device) {
-		dev_err(&pdev->dev, "unable to create SPI device\n");
+		dev_err(&pdev->dev, "unable to create mcp23s08 SPI device\n");
+		return -EINVAL;
+	}
+
+	mcp2210_eval->spi_device = spi_new_device(mcp2210_eval->spi_master,
+					          &tc77_temp);
+	if (!mcp2210_eval->spi_device) {
+		dev_err(&pdev->dev, "unable to create tc77 SPI device\n");
 		return -EINVAL;
 	}
 

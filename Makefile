@@ -1,4 +1,4 @@
-obj-m := hid-mcp2210.o mcp2210-eval.o
+obj-m := hid-mcp2210.o tc77.o mcp2210-eval.o
 
 ccflags-y += -g -DDEBUG
 
