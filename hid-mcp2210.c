@@ -100,7 +100,9 @@ struct mcp2210 {
 	void *out_buf;
 	void *in_buf;
 	unsigned int total_sent;
-	unsigned int total_received;
+	unsigned int tx_one_total_received;
+	u16 bytes_to_tx;
+	u16 total_received;
 };
 
 static int mcp2210_send_report(struct mcp2210 *mcp2210)
@@ -164,15 +166,21 @@ static int mcp2210_spi_prepare_message(struct spi_controller *controller,
 	u16 mode = spi->mode;
 	int ret = 0;
 
-	hid_info(mcp2210->hdev, "Message length %d\n", bytes_to_tx);
-
 	if (bytes_to_tx > MCP2210_SPI_MAX_TRANSLEN) {
 		dev_err(&spi->dev, "Message is too long (%d)\n",
 			message->frame_length);
 		return -EINVAL;
 	}
 
+	/*
+	 * Once we prepare a message we can't perform any other operation until
+	 * done with it. mcp2210's state machine goes wild otherwise. The lock
+	 * is released after in "mcp2210_spi_transfer_one".
+	 */
 	mutex_lock(&mcp2210->lock);
+	mcp2210->bytes_to_tx = bytes_to_tx;
+	mcp2210->total_received = 0;
+
 	memset(rep, 0, MCP2210_REPORT_SIZE);
 	rep->id = MCP2210_SET_SPI_SETTINGS;
 	rep->bit_rate = __cpu_to_le32(bit_rate);
@@ -180,10 +188,14 @@ static int mcp2210_spi_prepare_message(struct spi_controller *controller,
 	rep->active_cs_value |= (mode & SPI_CS_HIGH) << cs;
 	rep->bytes_to_tx = __cpu_to_le16(bytes_to_tx);
 	rep->mode = mode & 0x3;
+	hid_info(mcp2210->hdev, "%s, bit_rate %d, idle_cs 0x%x, active_cs_value 0x%x, len %d, mode %d\n",
+		 __func__, rep->bit_rate, rep->idle_cs_value, rep->active_cs_value, rep->bytes_to_tx,
+		 rep->mode);
 	ret = mcp2210_send_report(mcp2210);
-	if (ret)
+	if (ret) {
 		hid_err(mcp2210->hdev, "Failed to configure for SPI message\n");
-	mutex_unlock(&mcp2210->lock);
+		mutex_unlock(&mcp2210->lock);
+	}
 
 	return ret;
 }
@@ -195,14 +207,14 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 	struct mcp2210 *mcp2210 = spi_controller_get_devdata(controller);
 	struct mcp2210_spi_transfer_report *out_rep = mcp2210->out_buf;
 	struct mcp2210_response_report *in_rep = mcp2210->in_buf;
+	unsigned int tmp;
 
 	hid_info(mcp2210->hdev, "transfer... len %d\n", t->len);
 	mcp2210->total_sent = 0;
-	mcp2210->total_received = 0;
+	mcp2210->tx_one_total_received = 0;
 	memset(in_rep, 0, sizeof(*in_rep));
 	in_rep->status = MCP2210_STATUS_COMMAND_COMPLETED;
 	out_rep->id = MCP2210_SPI_TRANSFER;
-	mutex_lock(&mcp2210->lock);
 	while (true)
 	{
 		hid_info(mcp2210->hdev, "in_rep->len %d, mcp2210->total_sent %d, t->rx_buf %p, t->tx_buf %p\n", in_rep->data_len, mcp2210->total_sent, t->rx_buf, t->tx_buf);
@@ -210,20 +222,26 @@ static int mcp2210_spi_transfer_one(struct spi_controller *controller,
 		case MCP2210_STATUS_COMMAND_COMPLETED:
 			/* first we copy the received data, if any */
 			if (t->rx_buf && in_rep->data_len)
-				memcpy(t->rx_buf + mcp2210->total_received,
+				memcpy(t->rx_buf + mcp2210->tx_one_total_received,
 				       in_rep->data, in_rep->data_len);
+			mcp2210->tx_one_total_received += in_rep->data_len;
 			mcp2210->total_received += in_rep->data_len;
 
 			/* check if we sent the whole transfer already */
-			if (mcp2210->total_received >= t->len) {
-				mutex_unlock(&mcp2210->lock);
+			if (mcp2210->tx_one_total_received == t->len) {
+				/* check if we sent the whole message already */
+				if (mcp2210->total_received == mcp2210->bytes_to_tx) {
+					mutex_unlock(&mcp2210->lock);
+				}
 				return 0;
 			}
 
 			/* calculate the next output report's size...*/
-			out_rep->data_len = t->len - mcp2210->total_sent;
-			if (out_rep->data_len > MCP2210_SPI_MAX_XFERLEN)
+			tmp = t->len - mcp2210->total_sent;
+			if (tmp > MCP2210_SPI_MAX_XFERLEN)
 				out_rep->data_len = MCP2210_SPI_MAX_XFERLEN;
+			else
+				out_rep->data_len = tmp;
 
 			/* ... and copy the data if relevant */
 			if (t->tx_buf)

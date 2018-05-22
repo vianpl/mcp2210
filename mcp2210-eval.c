@@ -15,14 +15,20 @@
 #include <linux/spi/spi.h>
 #include <linux/platform_device.h>
 #include <linux/spi/mcp23s08.h>
+#include <linux/spi/eeprom.h>
+#include <linux/sizes.h>
 
 #define DRIVER_NAME			"mcp2210-eval"
 #define MCP2210_EVAL_SPI_BUS_NUM	34
 
 struct mcp2210_eval {
 	struct platform_device *pdev;
-	struct spi_device *spi_device;
 	struct spi_master *spi_master;
+
+	struct spi_device *gpio;
+	struct spi_device *temp;
+	struct spi_device *adc;
+	struct spi_device *eeprom;
 };
 
 static struct spi_board_info tc77_temp = {
@@ -30,7 +36,6 @@ static struct spi_board_info tc77_temp = {
 	.max_speed_hz = 5 * 1000 * 1000,
 	.chip_select = 7,
 	.mode = SPI_MODE_0,
-	.platform_data = NULL,
 };
 
 static struct mcp23s08_platform_data mcp23xx_pdata = {
@@ -40,10 +45,32 @@ static struct mcp23s08_platform_data mcp23xx_pdata = {
 
 static struct spi_board_info mcp23s08_gpio_expander = {
 	.modalias = "mcp23s08",
-	.max_speed_hz = 500 * 1000,
+	.max_speed_hz = 1000 * 1000,
 	.chip_select = 4,
 	.mode = SPI_MODE_0,
 	.platform_data = &mcp23xx_pdata,
+};
+
+static struct spi_board_info mcp3204_adc = {
+	.modalias = "mcp3204",
+	.max_speed_hz = 1000 * 1000,
+	.chip_select = 1,
+	.mode = SPI_MODE_0,
+};
+
+static struct spi_eeprom _25lc020_pdata = {
+	.byte_len = SZ_2K / 8,
+	.name = "25lc020",
+	.page_size = 16,
+	.flags = EE_ADDR1,
+};
+
+static struct spi_board_info _25lc020_eeprom = {
+	.modalias = "at25",
+	.max_speed_hz = 5 * 1000 * 1000,
+	.chip_select = 0,
+	.mode = SPI_MODE_0,
+	.platform_data = &_25lc020_pdata,
 };
 
 static int mcp2210_eval_probe(struct platform_device *pdev)
@@ -64,17 +91,31 @@ static int mcp2210_eval_probe(struct platform_device *pdev)
 		return -EPROBE_DEFER;
 	}
 
-	mcp2210_eval->spi_device = spi_new_device(mcp2210_eval->spi_master,
-					          &mcp23s08_gpio_expander);
-	if (!mcp2210_eval->spi_device) {
+	mcp2210_eval->gpio = spi_new_device(mcp2210_eval->spi_master,
+					        &mcp23s08_gpio_expander);
+	if (!mcp2210_eval->gpio) {
 		dev_err(&pdev->dev, "unable to create mcp23s08 SPI device\n");
 		return -EINVAL;
 	}
 
-	mcp2210_eval->spi_device = spi_new_device(mcp2210_eval->spi_master,
-					          &tc77_temp);
-	if (!mcp2210_eval->spi_device) {
+	mcp2210_eval->temp = spi_new_device(mcp2210_eval->spi_master,
+					    &tc77_temp);
+	if (!mcp2210_eval->temp) {
 		dev_err(&pdev->dev, "unable to create tc77 SPI device\n");
+		return -EINVAL;
+	}
+
+	mcp2210_eval->adc = spi_new_device(mcp2210_eval->spi_master,
+					       &mcp3204_adc);
+	if (!mcp2210_eval->adc) {
+		dev_err(&pdev->dev, "unable to create mcp3204 SPI device\n");
+		return -EINVAL;
+	}
+
+	mcp2210_eval->eeprom = spi_new_device(mcp2210_eval->spi_master,
+					       &_25lc020_eeprom);
+	if (!mcp2210_eval->eeprom) {
+		dev_err(&pdev->dev, "unable to create 25lc020 SPI device\n");
 		return -EINVAL;
 	}
 
@@ -87,7 +128,10 @@ int mcp2210_eval_remove(struct platform_device *pdev)
 {
 	struct mcp2210_eval *mcp2210_eval = platform_get_drvdata(pdev);
 
-	spi_unregister_device(mcp2210_eval->spi_device);
+	spi_unregister_device(mcp2210_eval->gpio);
+	spi_unregister_device(mcp2210_eval->temp);
+	spi_unregister_device(mcp2210_eval->adc);
+	spi_unregister_device(mcp2210_eval->eeprom);
 
 	return 0;
 }
